@@ -3,7 +3,7 @@ globalThis.__EXPERIMENT_ASSETS__ = {"/index.html":"<!doctype html>\n<html lang=\
 // server/main.ts
 import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
-import { dirname as dirname2, join as join2 } from "node:path";
+import { dirname as dirname3, join as join3 } from "node:path";
 
 // server/config.ts
 var env = (key, fallback) => {
@@ -823,10 +823,10 @@ function postChat(db2, userId, body) {
   lastMsg.set(userId, t);
   const u = getUser(db2, userId);
   const r2 = db2.prepare("INSERT INTO messages (channel, user_id, body, at) VALUES (?, ?, ?, ?)").run(`plot:${u.plot_id}`, userId, text, t);
-  const msg = { id: Number(r2.lastInsertRowid), body: text, at: t, subjectNo: pad6(u.subject_no), username: u.username, userId };
-  toPlot(u.plot_id, "chat", msg);
+  const msg2 = { id: Number(r2.lastInsertRowid), body: text, at: t, subjectNo: pad6(u.subject_no), username: u.username, userId };
+  toPlot(u.plot_id, "chat", msg2);
   completeQuest(db2, userId, "first_message");
-  return { ...msg, isYou: true };
+  return { ...msg2, isYou: true };
 }
 function plotMetrics(db2, plotId) {
   const residents = db2.prepare("SELECT COUNT(*) AS n FROM users WHERE plot_id = ?").get(plotId).n;
@@ -1197,9 +1197,395 @@ function login(db2, rawUsername, rawPassword) {
   return { userId: row.id, token: createSession(db2, row.id) };
 }
 
+// server/persist.ts
+import { readFile as readFile2, writeFile, rm, mkdir } from "node:fs/promises";
+import { dirname as dirname2, join as join2 } from "node:path";
+import { tmpdir } from "node:os";
+import { gzipSync, gunzipSync } from "node:zlib";
+
+// server/pg.ts
+import { connect as netConnect, isIP } from "node:net";
+import { connect as tlsConnect } from "node:tls";
+import { createHash as createHash2, createHmac, pbkdf2Sync, randomBytes as randomBytes2, timingSafeEqual as timingSafeEqual2 } from "node:crypto";
+var PgError = class extends Error {
+  code;
+  constructor(message, code) {
+    super(message);
+    this.code = code;
+  }
+};
+function parseUrl(url2) {
+  const u = new URL(url2);
+  if (!/^postgres(ql)?:$/.test(u.protocol)) throw new Error("DATABASE_URL \u0434\u043E\u043B\u0436\u0435\u043D \u043D\u0430\u0447\u0438\u043D\u0430\u0442\u044C\u0441\u044F \u0441 postgresql://");
+  const sslmode = u.searchParams.get("sslmode") ?? "prefer";
+  const cb = u.searchParams.get("channel_binding") ?? "prefer";
+  return {
+    host: u.hostname,
+    port: Number(u.port || 5432),
+    user: decodeURIComponent(u.username),
+    password: decodeURIComponent(u.password),
+    database: decodeURIComponent(u.pathname.slice(1)) || decodeURIComponent(u.username),
+    // libpq: require шифрует без проверки сертификата. Мы проверяем всегда,
+    // кроме sslmode=disable или явного PGSSL_NO_VERIFY=1 (для локальных тестов).
+    ssl: sslmode === "disable" ? "disable" : process.env.PGSSL_NO_VERIFY === "1" ? "require" : "verify",
+    channelBinding: cb
+  };
+}
+var int32 = (n) => {
+  const b = Buffer.alloc(4);
+  b.writeInt32BE(n);
+  return b;
+};
+var int16 = (n) => {
+  const b = Buffer.alloc(2);
+  b.writeInt16BE(n);
+  return b;
+};
+var cstr = (s) => Buffer.concat([Buffer.from(s, "utf8"), Buffer.from([0])]);
+var msg = (type, ...parts) => {
+  const body = Buffer.concat(parts);
+  return Buffer.concat([Buffer.from(type), int32(body.length + 4), body]);
+};
+function certHash(der) {
+  const hex = der.toString("hex");
+  const has = (oidHex) => hex.includes(oidHex);
+  const algo = has("2a864886f70d01010d") || has("2a8648ce3d040304") ? "sha512" : has("2a864886f70d01010c") || has("2a8648ce3d040303") ? "sha384" : "sha256";
+  return createHash2(algo).update(der).digest();
+}
+var PgClient = class _PgClient {
+  cfg;
+  sock = null;
+  buf = Buffer.alloc(0);
+  waiters = [];
+  queue = [];
+  closed = null;
+  constructor(url2) {
+    this.cfg = parseUrl(url2);
+  }
+  attach(sock) {
+    this.sock = sock;
+    sock.on("data", (d) => this.onData(d));
+    const die = (e) => {
+      this.closed = e;
+      for (const w of this.waiters.splice(0)) w({ type: "!", body: Buffer.from(e.message) });
+    };
+    sock.on("error", die);
+    sock.on("close", () => die(new Error("\u0441\u043E\u0435\u0434\u0438\u043D\u0435\u043D\u0438\u0435 \u0441 PostgreSQL \u0437\u0430\u043A\u0440\u044B\u0442\u043E")));
+  }
+  onData(d) {
+    this.buf = Buffer.concat([this.buf, d]);
+    while (this.buf.length >= 5) {
+      const len = this.buf.readInt32BE(1);
+      if (this.buf.length < len + 1) break;
+      const m = { type: String.fromCharCode(this.buf[0]), body: this.buf.subarray(5, len + 1) };
+      this.buf = this.buf.subarray(len + 1);
+      const w = this.waiters.shift();
+      if (w) w(m);
+      else this.queue.push(m);
+    }
+  }
+  next() {
+    const m = this.queue.shift();
+    if (m) return Promise.resolve(m);
+    if (this.closed) return Promise.reject(this.closed);
+    return new Promise(
+      (resolve, reject) => this.waiters.push((x) => x.type === "!" ? reject(new Error(x.body.toString())) : resolve(x))
+    );
+  }
+  write(b) {
+    this.sock.write(b);
+  }
+  static error(body) {
+    const f = {};
+    let i = 0;
+    while (i < body.length && body[i] !== 0) {
+      const code = String.fromCharCode(body[i]);
+      const end = body.indexOf(0, i + 1);
+      f[code] = body.subarray(i + 1, end).toString("utf8");
+      i = end + 1;
+    }
+    return new PgError(f.M ?? "\u043E\u0448\u0438\u0431\u043A\u0430 PostgreSQL", f.C ?? "");
+  }
+  async connect(timeoutMs = 15e3) {
+    const { host, port } = this.cfg;
+    const raw = await new Promise((resolve, reject) => {
+      const s = netConnect({ host, port });
+      const t = setTimeout(() => {
+        s.destroy();
+        reject(new Error(`\u043D\u0435\u0442 \u0441\u043E\u0435\u0434\u0438\u043D\u0435\u043D\u0438\u044F \u0441 ${host}:${port}`));
+      }, timeoutMs);
+      s.once("connect", () => {
+        clearTimeout(t);
+        resolve(s);
+      });
+      s.once("error", (e) => {
+        clearTimeout(t);
+        reject(e);
+      });
+    });
+    let sock = raw;
+    if (this.cfg.ssl !== "disable") {
+      raw.write(Buffer.concat([int32(8), int32(80877103)]));
+      const answer = await new Promise((resolve) => raw.once("data", resolve));
+      if (answer[0] !== 83) throw new Error("\u0441\u0435\u0440\u0432\u0435\u0440 PostgreSQL \u043D\u0435 \u043F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442 TLS");
+      sock = await new Promise((resolve, reject) => {
+        const t = tlsConnect({ socket: raw, servername: isIP(host) ? void 0 : host, rejectUnauthorized: this.cfg.ssl === "verify" });
+        t.once("secureConnect", () => resolve(t));
+        t.once("error", reject);
+      });
+    }
+    this.attach(sock);
+    this.write((() => {
+      const body = Buffer.concat([
+        int32(196608),
+        cstr("user"),
+        cstr(this.cfg.user),
+        cstr("database"),
+        cstr(this.cfg.database),
+        cstr("application_name"),
+        cstr("the-experiment"),
+        Buffer.from([0])
+      ]);
+      return Buffer.concat([int32(body.length + 4), body]);
+    })());
+    await this.authenticate();
+    for (; ; ) {
+      const m = await this.next();
+      if (m.type === "Z") return;
+      if (m.type === "E") throw _PgClient.error(m.body);
+    }
+  }
+  async authenticate() {
+    let scram = null;
+    for (; ; ) {
+      const m = await this.next();
+      if (m.type === "E") throw _PgClient.error(m.body);
+      if (m.type !== "R") continue;
+      const code = m.body.readInt32BE(0);
+      if (code === 0) return;
+      if (code === 3) {
+        this.write(msg("p", cstr(this.cfg.password)));
+      } else if (code === 5) {
+        const salt = m.body.subarray(4, 8);
+        const inner = createHash2("md5").update(this.cfg.password + this.cfg.user).digest("hex");
+        const outer = createHash2("md5").update(Buffer.concat([Buffer.from(inner), salt])).digest("hex");
+        this.write(msg("p", cstr("md5" + outer)));
+      } else if (code === 10) {
+        const mechs = m.body.subarray(4).toString("utf8").split("\0").filter(Boolean);
+        const tls = this.sock;
+        const canPlus = mechs.includes("SCRAM-SHA-256-PLUS") && typeof tls.getPeerCertificate === "function" && this.cfg.channelBinding !== "disable";
+        if (this.cfg.channelBinding === "require" && !canPlus) throw new Error("channel_binding=require, \u043D\u043E \u0441\u0435\u0440\u0432\u0435\u0440 \u043D\u0435 \u043F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442 SCRAM-SHA-256-PLUS");
+        if (!mechs.includes("SCRAM-SHA-256")) throw new Error(`\u043D\u0435\u043F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u043C\u0430\u044F \u0430\u0443\u0442\u0435\u043D\u0442\u0438\u0444\u0438\u043A\u0430\u0446\u0438\u044F: ${mechs.join(", ")}`);
+        const mech = canPlus ? "SCRAM-SHA-256-PLUS" : "SCRAM-SHA-256";
+        const gs2 = canPlus ? "p=tls-server-end-point,," : this.cfg.channelBinding === "disable" || !this.sock.encrypted ? "n,," : "y,,";
+        const cbData = canPlus ? certHash(tls.getPeerCertificate(false).raw) : Buffer.alloc(0);
+        const nonce = randomBytes2(18).toString("base64");
+        const bare = `n=*,r=${nonce}`;
+        scram = { nonce, bare, gs2, cbData };
+        const first = Buffer.from(gs2 + bare, "utf8");
+        this.write(msg("p", cstr(mech), int32(first.length), first));
+      } else if (code === 11) {
+        if (!scram) throw new Error("\u043D\u0435\u043E\u0436\u0438\u0434\u0430\u043D\u043D\u044B\u0439 SASLContinue");
+        const serverFirst = m.body.subarray(4).toString("utf8");
+        const attrs = Object.fromEntries(serverFirst.split(",").map((kv) => [kv[0], kv.slice(2)]));
+        if (!attrs.r?.startsWith(scram.nonce)) throw new Error("SCRAM: \u043D\u0435\u0432\u0435\u0440\u043D\u044B\u0439 nonce \u0441\u0435\u0440\u0432\u0435\u0440\u0430");
+        const salted = pbkdf2Sync(this.cfg.password.normalize("NFKC"), Buffer.from(attrs.s, "base64"), Number(attrs.i), 32, "sha256");
+        const clientKey = createHmac("sha256", salted).update("Client Key").digest();
+        const storedKey = createHash2("sha256").update(clientKey).digest();
+        const cbind = Buffer.concat([Buffer.from(scram.gs2), scram.cbData]).toString("base64");
+        const finalNoProof = `c=${cbind},r=${attrs.r}`;
+        const authMessage = `${scram.bare},${serverFirst},${finalNoProof}`;
+        const sig = createHmac("sha256", storedKey).update(authMessage).digest();
+        const proof = Buffer.from(clientKey.map((b, i) => b ^ sig[i]));
+        const serverKey = createHmac("sha256", salted).update("Server Key").digest();
+        scram.expectedSig = createHmac("sha256", serverKey).update(authMessage).digest();
+        this.write(msg("p", Buffer.from(`${finalNoProof},p=${proof.toString("base64")}`)));
+      } else if (code === 12) {
+        const v = m.body.subarray(4).toString("utf8");
+        const got = Buffer.from(v.replace(/^v=/, ""), "base64");
+        if (!scram?.expectedSig || got.length !== scram.expectedSig.length || !timingSafeEqual2(got, scram.expectedSig))
+          throw new Error("SCRAM: \u043F\u043E\u0434\u043F\u0438\u0441\u044C \u0441\u0435\u0440\u0432\u0435\u0440\u0430 \u043D\u0435 \u0441\u043E\u0432\u043F\u0430\u043B\u0430");
+      } else {
+        throw new Error(`\u043D\u0435\u043F\u043E\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u043C\u044B\u0439 \u043C\u0435\u0442\u043E\u0434 \u0430\u0443\u0442\u0435\u043D\u0442\u0438\u0444\u0438\u043A\u0430\u0446\u0438\u0438 PostgreSQL (${code})`);
+      }
+    }
+  }
+  // Параметризованный запрос (текстовый формат). null → SQL NULL.
+  async query(sql, params = []) {
+    if (!this.sock) throw new Error("\u043D\u0435 \u043F\u043E\u0434\u043A\u043B\u044E\u0447\u0435\u043D\u043E");
+    const bind = [cstr(""), cstr(""), int16(0), int16(params.length)];
+    for (const p of params) {
+      if (p === null) bind.push(int32(-1));
+      else {
+        const b = Buffer.from(String(p), "utf8");
+        bind.push(int32(b.length), b);
+      }
+    }
+    bind.push(int16(0));
+    this.write(Buffer.concat([
+      msg("P", cstr(""), cstr(sql), int16(0)),
+      msg("B", ...bind),
+      msg("D", Buffer.from("P"), cstr("")),
+      msg("E", cstr(""), int32(0)),
+      msg("S")
+    ]));
+    const rows = [];
+    let cols = [];
+    let err = null;
+    for (; ; ) {
+      const m = await this.next();
+      if (m.type === "T") {
+        const n = m.body.readInt16BE(0);
+        cols = [];
+        let i = 2;
+        for (let c = 0; c < n; c++) {
+          const end = m.body.indexOf(0, i);
+          cols.push(m.body.subarray(i, end).toString("utf8"));
+          i = end + 1 + 18;
+        }
+      } else if (m.type === "D") {
+        const n = m.body.readInt16BE(0);
+        const row = {};
+        let i = 2;
+        for (let c = 0; c < n; c++) {
+          const len = m.body.readInt32BE(i);
+          i += 4;
+          row[cols[c]] = len < 0 ? null : m.body.subarray(i, i + len).toString("utf8");
+          if (len > 0) i += len;
+        }
+        rows.push(row);
+      } else if (m.type === "E") {
+        err = _PgClient.error(m.body);
+      } else if (m.type === "Z") {
+        if (err) throw err;
+        return rows;
+      }
+    }
+  }
+  async close() {
+    if (!this.sock || this.closed) return;
+    try {
+      this.write(msg("X"));
+    } catch {
+    }
+    this.sock.end();
+  }
+};
+var toBytea = (b) => "\\x" + b.toString("hex");
+var fromBytea = (s) => Buffer.from(s.replace(/^\\x/, ""), "hex");
+
+// server/persist.ts
+var url = process.env.DATABASE_URL;
+var intervalMs = Number(process.env.SAVE_INTERVAL_MS) || 1e4;
+var KEY = process.env.SNAPSHOT_KEY || "main";
+var persistence = {
+  enabled: !!url,
+  lastSavedAt: 0,
+  lastSize: 0,
+  lastError: "",
+  restoredFrom: 0
+};
+var client = null;
+async function getClient() {
+  if (client && !client.closed) return client;
+  client = new PgClient(url);
+  await client.connect();
+  await client.query(`CREATE TABLE IF NOT EXISTS experiment_snapshots (
+    key TEXT PRIMARY KEY,
+    data BYTEA NOT NULL,
+    size INTEGER NOT NULL,
+    saved_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`);
+  return client;
+}
+async function restoreSnapshot(dbPath) {
+  if (!url) {
+    console.warn("DATABASE_URL \u043D\u0435 \u0437\u0430\u0434\u0430\u043D: \u043F\u0440\u043E\u0433\u0440\u0435\u0441\u0441 \u0445\u0440\u0430\u043D\u0438\u0442\u0441\u044F \u0442\u043E\u043B\u044C\u043A\u043E \u043D\u0430 \u0434\u0438\u0441\u043A\u0435 \u0441\u0435\u0440\u0432\u0435\u0440\u0430.");
+    return;
+  }
+  let rows = [];
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const c = await getClient();
+      rows = await c.query("SELECT data, saved_at FROM experiment_snapshots WHERE key = $1", [KEY]);
+      break;
+    } catch (e) {
+      client = null;
+      if (attempt >= 5) throw new Error(`PostgreSQL \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D, \u0437\u0430\u043F\u0443\u0441\u043A \u043E\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D: ${e.message}`);
+      console.warn(`PostgreSQL: \u043F\u043E\u043F\u044B\u0442\u043A\u0430 ${attempt} \u043D\u0435 \u0443\u0434\u0430\u043B\u0430\u0441\u044C (${e.message}), \u043F\u043E\u0432\u0442\u043E\u0440\u2026`);
+      await new Promise((r2) => setTimeout(r2, 2e3 * attempt));
+    }
+  }
+  if (!rows.length) {
+    console.log("\u0421\u043D\u0438\u043C\u043E\u043A \u0432 PostgreSQL \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D \u2014 \u0441\u043E\u0437\u0434\u0430\u0451\u0442\u0441\u044F \u043D\u043E\u0432\u044B\u0439 \u043C\u0438\u0440.");
+    return;
+  }
+  const data = gunzipSync(fromBytea(rows[0].data));
+  await mkdir(dirname2(dbPath), { recursive: true });
+  for (const ext of ["", "-wal", "-shm"]) await rm(dbPath + ext, { force: true });
+  await writeFile(dbPath, data);
+  persistence.restoredFrom = Date.parse(rows[0].saved_at);
+  console.log(`\u041C\u0438\u0440 \u0432\u043E\u0441\u0441\u0442\u0430\u043D\u043E\u0432\u043B\u0435\u043D \u0438\u0437 \u0441\u043D\u0438\u043C\u043A\u0430 (${(data.length / 1024).toFixed(0)} \u041A\u0411, ${rows[0].saved_at}).`);
+}
+var lastChanges = -1;
+var saving = null;
+function saveSnapshot(db2, force = false) {
+  if (!url) return Promise.resolve();
+  if (saving) return saving;
+  const changes = db2.prepare("SELECT total_changes() AS n").get().n;
+  if (!force && changes === lastChanges) return Promise.resolve();
+  const tmp = join2(tmpdir(), `experiment-snap-${process.pid}.db`);
+  saving = (async () => {
+    try {
+      await rm(tmp, { force: true });
+      db2.exec(`VACUUM INTO '${tmp.replace(/'/g, "''")}'`);
+      const raw = await readFile2(tmp);
+      const packed = gzipSync(raw, { level: 6 });
+      const c = await getClient();
+      await c.query(
+        `INSERT INTO experiment_snapshots (key, data, size, saved_at)
+         SELECT $2, data, size, saved_at FROM experiment_snapshots WHERE key = $1
+         ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, size = EXCLUDED.size, saved_at = EXCLUDED.saved_at`,
+        [KEY, `${KEY}:backup`]
+      );
+      await c.query(
+        `INSERT INTO experiment_snapshots (key, data, size) VALUES ($1, $2, $3)
+         ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, size = EXCLUDED.size, saved_at = now()`,
+        [KEY, toBytea(packed), raw.length]
+      );
+      lastChanges = changes;
+      persistence.lastSavedAt = Date.now();
+      persistence.lastSize = raw.length;
+      persistence.lastError = "";
+    } catch (e) {
+      persistence.lastError = e.message;
+      console.error("\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u0441\u043E\u0445\u0440\u0430\u043D\u0438\u0442\u044C \u0441\u043D\u0438\u043C\u043E\u043A:", e.message);
+      if (client) {
+        client.close();
+        client = null;
+      }
+    } finally {
+      await rm(tmp, { force: true }).catch(() => {
+      });
+      saving = null;
+    }
+  })();
+  return saving;
+}
+function startAutosave(db2) {
+  if (!url) return null;
+  lastChanges = db2.prepare("SELECT total_changes() AS n").get().n;
+  console.log(`\u0410\u0432\u0442\u043E\u0441\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u0438\u0435 \u0432 PostgreSQL \u043A\u0430\u0436\u0434\u044B\u0435 ${intervalMs / 1e3} \u0441.`);
+  return setInterval(() => void saveSnapshot(db2), intervalMs);
+}
+async function closePersistence() {
+  if (client) await client.close();
+}
+
 // server/main.ts
-var root = dirname2(dirname2(fileURLToPath(import.meta.url)));
-var publicDir = join2(root, "public");
+var root = dirname3(dirname3(fileURLToPath(import.meta.url)));
+var publicDir = join3(root, "public");
+await restoreSnapshot(SERVER.dbPath);
 var db = openDb(SERVER.dbPath);
 var COOKIE = "exp_session";
 var sessionCookie = (token, maxAgeSec) => `${COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAgeSec}${SERVER.secureCookies ? "; Secure" : ""}`;
@@ -1221,7 +1607,11 @@ r.post("/api/auth/logout", (c) => {
   c.res.setHeader("Set-Cookie", sessionCookie("", 0));
   return { ok: true };
 }, false);
-r.get("/api/health", () => ({ ok: true, time: Date.now() }), false);
+r.get("/api/health", () => ({
+  ok: true,
+  time: Date.now(),
+  persistence: { enabled: persistence.enabled, lastSavedAt: persistence.lastSavedAt || null, restoredFrom: persistence.restoredFrom || null, error: persistence.lastError || null }
+}), false);
 var uid = (c) => c.userId;
 r.get("/api/me", (c) => me(db, uid(c)));
 r.get("/api/home", (c) => home(db, uid(c)));
@@ -1246,26 +1636,26 @@ r.post("/api/trials/:id/act", (c) => act(db, uid(c), Number(c.params.id), c.body
 r.get("/api/notifications", (c) => notifications(db, uid(c)));
 r.post("/api/notifications/read", (c) => markRead(db, uid(c)));
 var server = createServer(async (req, res) => {
-  const url = new URL(req.url ?? "/", "http://localhost");
+  const url2 = new URL(req.url ?? "/", "http://localhost");
   const fwd = SERVER.trustProxy ? String(req.headers["x-forwarded-for"] ?? "").split(",")[0].trim() : "";
   const ip = (fwd || req.socket.remoteAddress || "unknown").replace("::ffff:", "");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "no-referrer");
   try {
-    if (!url.pathname.startsWith("/api/")) {
-      if (req.method === "GET" && await serveStatic(publicDir, url.pathname, res)) return;
+    if (!url2.pathname.startsWith("/api/")) {
+      if (req.method === "GET" && await serveStatic(publicDir, url2.pathname, res)) return;
       if (req.method === "GET" && await serveStatic(publicDir, "/index.html", res)) return;
       return sendJson(res, 404, { error: "NOT_FOUND" });
     }
     const token = parseCookies(req.headers.cookie)[COOKIE];
     const userId = userFromToken(db, token);
-    if (url.pathname === "/api/stream" && req.method === "GET") {
+    if (url2.pathname === "/api/stream" && req.method === "GET") {
       if (!userId) fail(401, "UNAUTHORIZED", "\u0422\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044F \u0432\u0445\u043E\u0434");
       const u = getUser(db, userId);
       subscribe(res, userId, u.plot_id);
       return;
     }
-    const m = r.match(req.method ?? "GET", url.pathname);
+    const m = r.match(req.method ?? "GET", url2.pathname);
     if (!m) fail(404, "NOT_FOUND", "\u041D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u044B\u0439 \u0430\u0434\u0440\u0435\u0441 API");
     const { route, params } = m;
     if (req.method !== "GET") {
@@ -1280,7 +1670,7 @@ var server = createServer(async (req, res) => {
       rateLimit(`anon:${ip}`, SERVER.anonPerMinute, 6e4);
     }
     const body = await readBody(req);
-    const ctx = { req, res, url, params, body: body ?? {}, ip, userId };
+    const ctx = { req, res, url: url2, params, body: body ?? {}, ip, userId };
     const data = await route.handler(ctx);
     sendJson(res, 200, data);
   } catch (e) {
@@ -1291,15 +1681,27 @@ var server = createServer(async (req, res) => {
 });
 var timer = setInterval(() => schedulerTick(db), SERVER.schedulerIntervalMs);
 schedulerTick(db);
+var autosave = startAutosave(db);
 server.listen(SERVER.port, "0.0.0.0", () => {
   console.log(`THE EXPERIMENT :: \u0441\u0435\u0440\u0432\u0435\u0440 \u0437\u0430\u043F\u0443\u0449\u0435\u043D \u043D\u0430 http://localhost:${SERVER.port}`);
 });
-var shutdown = () => {
+var stopping = false;
+var shutdown = async () => {
+  if (stopping) return;
+  stopping = true;
   clearInterval(timer);
+  if (autosave) clearInterval(autosave);
   server.close();
   server.closeAllConnections();
-  db.close();
-  process.exit(0);
+  try {
+    await saveSnapshot(db);
+    await saveSnapshot(db);
+    if (persistence.enabled) console.log("\u041C\u0438\u0440 \u0441\u043E\u0445\u0440\u0430\u043D\u0451\u043D \u043F\u0435\u0440\u0435\u0434 \u043E\u0441\u0442\u0430\u043D\u043E\u0432\u043A\u043E\u0439.");
+  } finally {
+    await closePersistence();
+    db.close();
+    process.exit(0);
+  }
 };
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
