@@ -1,0 +1,11 @@
+{
+  "name": "the-experiment",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "22.x"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning game.mjs"
+  }
+}
